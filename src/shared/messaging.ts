@@ -13,6 +13,8 @@ export type BgMessage =
   | { type: 'OPEN_OR_FOCUS_URL'; url: string }
   | { type: 'IMPORT_ITEMS'; items: Array<{ url: string; title?: string; status?: Item['status']; tags?: string[]; createdAt?: number }> }
   | { type: 'CLOSE_TABS'; tabIds: number[]; includePinned?: boolean }
+  | { type: 'EXTEND_LIFESPAN'; id: string; additionalDays: number }
+  | { type: 'GENERATE_SUMMARY'; id: string }
 
 export type BgResponse =
   | { ok: true; pong: true }
@@ -25,6 +27,8 @@ export type BgResponse =
   | { ok: true; opened?: boolean; focused?: boolean }
   | { ok: true; imported: number; updated: number }
   | { ok: true; closed: number }
+  | { ok: true; extended: true }
+  | { ok: true; summary: string }
   | { ok: false; error: string }
 
 export function sendMessage<T extends BgMessage>(msg: T): Promise<BgResponse> {

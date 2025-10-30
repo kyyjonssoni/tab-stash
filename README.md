@@ -6,6 +6,8 @@
     Stash locally • Read‑later statuses • Fast search & tags
     <br />
     Bulk restore • Import/Export • Privacy‑first, offline
+    <br />
+    30-day lifespan tracking • AI summaries • Auto-archive • OneTab import
   </em>
 
   <br /><br />
@@ -69,6 +71,34 @@ npm run package
 
 
 UI uses Tailwind and shadcn/ui components in [src/components/ui/](src/components/ui/).
+
+## Features
+
+### Lifespan Tracking
+- Each stashed tab has a 30-day lifespan
+- Visual progress bar showing time remaining
+- Auto-archive when expired
+- Extend lifespan with +7d button
+- Light-hearted shaming messages for stale items
+
+### AI Summaries (Placeholder)
+- Generate AI summaries for articles
+- Placeholder implementation ready for API integration
+- See [docs/new-features.md](docs/new-features.md) for implementation guide
+
+### OneTab Import
+- Import tabs from OneTab extension
+- Paste OneTab export text directly
+- Auto-tags imported items
+- Handles duplicates automatically
+
+### Auto-Archive
+- Expired items automatically move to Archive
+- Background job runs every 6 hours
+- Keep your reading list clean
+- Restore anytime
+
+See [docs/new-features.md](docs/new-features.md) for detailed feature documentation.
 
 ## Keyboard Shortcuts (editable in Chrome)
 - Stash all tabs:

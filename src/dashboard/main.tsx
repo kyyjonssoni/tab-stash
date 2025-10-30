@@ -15,11 +15,13 @@ import { Table, TableHeader, TableHead, TableRow, TableBody, TableCell } from '@
 // Status filter now uses DropdownMenu with checkboxes (multi-select)
 import { Dialog as ConfirmDialog, DialogContent as ConfirmContent, DialogHeader as ConfirmHeader, DialogTitle as ConfirmTitle, DialogDescription as ConfirmDescription } from '@/components/ui/dialog'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
-import { ChevronsUpDown, Info } from 'lucide-react'
+import { ChevronsUpDown, Info, Clock, Sparkles } from 'lucide-react'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
 import { SelectionBar } from './components/SelectionBar'
 import { RowActions } from './components/RowActions'
 import { useDebounce } from '@/hooks/use-debounce'
+import { getLifespanProgress, getRemainingDays, getShamingMessage, getStalenessLevel, getProgressColor } from '@/shared/lifespan'
+import { parseOneTabExport, oneTabToItems, parseOneTabExportWithGroups, type OneTabGroup } from '@/shared/onetab-import'
 
 // Apply system theme (MV3 CSP-safe)
 initSystemTheme()
@@ -43,9 +45,17 @@ function Dashboard() {
   const [closingStashed, setClosingStashed] = React.useState(false)
   const [confirmCloseStashed, setConfirmCloseStashed] = React.useState(false)
   const editorRef = React.useRef<HTMLDivElement | null>(null)
-  type SortKey = 'createdAt' | 'title' | 'domain' | 'status'
+  type SortKey = 'createdAt' | 'title' | 'domain' | 'status' | 'lifespan'
   const [sortKey, setSortKey] = React.useState<SortKey>('createdAt')
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('desc')
+  const [oneTabText, setOneTabText] = React.useState('')
+  const [oneTabDialogOpen, setOneTabDialogOpen] = React.useState(false)
+  const [oneTabGroups, setOneTabGroups] = React.useState<OneTabGroup[]>([])
+  const [oneTabPreviewMode, setOneTabPreviewMode] = React.useState(false)
+  const [summaryDialogOpen, setSummaryDialogOpen] = React.useState(false)
+  const [summaryItemId, setSummaryItemId] = React.useState<string | null>(null)
+  const [generatingSummary, setGeneratingSummary] = React.useState(false)
+  const [selectedGroups, setSelectedGroups] = React.useState<string[]>([])
 
   function displayStatus(s: Item['status']): string {
     if (s === 'stashed') return 'To Read'
@@ -131,13 +141,20 @@ function Dashboard() {
     return Array.from(s).sort()
   }, [items])
 
+  const uniqueGroups = React.useMemo(() => {
+    const s = new Set<string>()
+    for (const it of items) if (it.group) s.add(it.group)
+    return Array.from(s).sort()
+  }, [items])
+
   const filtered = React.useMemo(() => {
     return items.filter((it) => {
       const byStatus = statusMulti.length === 0 || statusMulti.includes(it.status)
       const byTagMulti = selectedTags.length === 0 || (it.tags || []).some((t) => selectedTags.includes(t))
-      return byStatus && byTagMulti
+      const byGroup = selectedGroups.length === 0 || (it.group && selectedGroups.includes(it.group))
+      return byStatus && byTagMulti && byGroup
     })
-  }, [items, statusMulti, selectedTags])
+  }, [items, statusMulti, selectedTags, selectedGroups])
 
   function domainOf(it: Item) {
     try { return new URL(it.url).host.toLowerCase() } catch { return '' }
@@ -151,6 +168,7 @@ function Dashboard() {
       else if (sortKey === 'title') { av = (a.title || a.url).toLowerCase(); bv = (b.title || b.url).toLowerCase() }
       else if (sortKey === 'domain') { av = domainOf(a); bv = domainOf(b) }
       else if (sortKey === 'status') { av = a.status; bv = b.status }
+      else if (sortKey === 'lifespan') { av = getLifespanProgress(a); bv = getLifespanProgress(b) }
       if (av < bv) return sortDir === 'asc' ? -1 : 1
       if (av > bv) return sortDir === 'asc' ? 1 : -1
       return 0
@@ -325,6 +343,66 @@ function Dashboard() {
     await Promise.all(workers)
   }
 
+  async function previewOneTabImport() {
+    if (!oneTabText.trim()) {
+      toast('Please paste OneTab export data')
+      return
+    }
+    const groups = parseOneTabExportWithGroups(oneTabText)
+    if (!groups.length) {
+      toast('No valid URLs found')
+      return
+    }
+    setOneTabGroups(groups)
+    setOneTabPreviewMode(true)
+  }
+
+  async function importOneTab() {
+    if (!oneTabPreviewMode) {
+      await previewOneTabImport()
+      return
+    }
+    
+    const lines = parseOneTabExport(oneTabText)
+    if (!lines.length) {
+      toast('No valid URLs found')
+      return
+    }
+    const items = oneTabToItems(lines)
+    const res = await sendMessage({ type: 'IMPORT_ITEMS', items })
+    if (res.ok && 'imported' in res) {
+      const groupCount = oneTabGroups.length
+      toast(`Imported ${res.imported} items from ${groupCount} group(s), updated ${res.updated}`)
+      setOneTabDialogOpen(false)
+      setOneTabText('')
+      setOneTabGroups([])
+      setOneTabPreviewMode(false)
+      await refresh()
+    }
+  }
+
+  async function generateSummary(itemId: string) {
+    setGeneratingSummary(true)
+    const res = await sendMessage({ type: 'GENERATE_SUMMARY', id: itemId })
+    setGeneratingSummary(false)
+    if (res.ok && 'summary' in res) {
+      toast('Summary generated')
+      await refresh()
+    } else if ('error' in res) {
+      toast(`Error: ${res.error}`)
+    }
+  }
+
+  async function extendLifespan(itemId: string, days: number) {
+    const res = await sendMessage({ type: 'EXTEND_LIFESPAN', id: itemId, additionalDays: days })
+    if (res.ok && 'extended' in res) {
+      toast(`Extended lifespan by ${days} day(s)`)
+      await refresh()
+    } else if ('error' in res) {
+      toast(`Error: ${res.error}`)
+    }
+  }
+
   return (
     <div className="p-4 space-y-3">
       <h2 className="text-xl font-semibold flex items-center gap-2">
@@ -497,6 +575,63 @@ function Dashboard() {
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
+        <div className="min-w-[240px] shrink-0">
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" className="h-8 w-full justify-start gap-2 overflow-hidden">
+                {selectedGroups.length === 0 ? (
+                  <span className="text-muted-foreground">Filter by group</span>
+                ) : (
+                  <div className="flex gap-1 flex-wrap items-center">
+                    {selectedGroups.slice(0, 2).map((g) => (
+                      <Badge key={g} variant="outline" className="flex items-center gap-1">
+                        {g}
+                        <span
+                          role="button"
+                          aria-label={`Remove ${g}`}
+                          className="cursor-pointer opacity-70 hover:opacity-100"
+                          onPointerDown={(e) => { e.preventDefault(); e.stopPropagation() }}
+                          onMouseDown={(e) => { e.preventDefault(); e.stopPropagation() }}
+                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); setSelectedGroups((arr) => arr.filter((x) => x !== g)) }}
+                        >×</span>
+                      </Badge>
+                    ))}
+                    {selectedGroups.length > 2 && (
+                      <Badge variant="secondary">+{selectedGroups.length - 2}</Badge>
+                    )}
+                  </div>
+                )}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="w-[240px] bg-background border shadow-lg z-[1000]">
+              {uniqueGroups.length === 0 ? (
+                <DropdownMenuItem disabled>No groups</DropdownMenuItem>
+              ) : (
+                uniqueGroups.map((g) => (
+                  <DropdownMenuCheckboxItem
+                    key={g}
+                    checked={selectedGroups.includes(g)}
+                    onSelect={(e) => e.preventDefault()}
+                    onCheckedChange={(v) => {
+                      const checked = !!v
+                      setSelectedGroups((prev) => {
+                        if (checked) return Array.from(new Set([...prev, g]))
+                        return prev.filter((x) => x !== g)
+                      })
+                    }}
+                  >
+                    {g}
+                  </DropdownMenuCheckboxItem>
+                ))
+              )}
+              {selectedGroups.length > 0 && (
+                <>
+                  <DropdownMenuItem onSelect={(e) => e.preventDefault()} onClick={() => setSelectedGroups([])}>Clear selection</DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
         <div className="ml-auto flex items-center gap-2">
           <Button size="sm" variant="secondary" onClick={() => { openStashedIds.length > 10 ? setConfirmCloseStashed(true) : closeOpenStashedTabs() }} disabled={closingStashed || openStashedIds.length === 0}>
             {closingStashed ? 'Closing…' : `Close Stashed (${openStashedIds.length})`}
@@ -524,6 +659,7 @@ function Dashboard() {
             e.currentTarget.value = ''
           }} />
           <Button size="sm" variant="outline" onClick={() => fileRef.current?.click()}>Import CSV</Button>
+          <Button size="sm" variant="outline" onClick={() => setOneTabDialogOpen(true)}>Import OneTab</Button>
         </div>
       </div>
 
@@ -576,9 +712,16 @@ function Dashboard() {
               </Button>
             </TableHead>
             <TableHead className="w-[250px]">Tags</TableHead>
+            <TableHead className="w-[180px]">Group</TableHead>
             <TableHead>
               <Button variant="ghost" size="sm" className="-ml-3 h-8 gap-1.5" onClick={() => toggleSort('createdAt')}>
                 <span>Added</span>
+                <ChevronsUpDown className="size-4" />
+              </Button>
+            </TableHead>
+            <TableHead className="w-[180px]">
+              <Button variant="ghost" size="sm" className="-ml-3 h-8 gap-1.5" onClick={() => toggleSort('lifespan')}>
+                <span>Lifespan</span>
                 <ChevronsUpDown className="size-4" />
               </Button>
             </TableHead>
@@ -715,7 +858,78 @@ function Dashboard() {
                   </div>
                 )}
               </TableCell>
+              <TableCell className="w-[180px]">
+                {it.group && (
+                  <Badge variant="outline" className="text-xs">
+                    {it.group}
+                  </Badge>
+                )}
+              </TableCell>
               <TableCell className="text-xs text-gray-500">{fmtDate(it.createdAt)}</TableCell>
+              <TableCell className="w-[180px]">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full transition-all ${getProgressColor(getLifespanProgress(it))}`}
+                        style={{ width: `${Math.min(getLifespanProgress(it), 100)}%` }}
+                      />
+                    </div>
+                    <span className="text-xs text-gray-600 dark:text-gray-400 min-w-[40px]">
+                      {getRemainingDays(it)}d
+                    </span>
+                  </div>
+                  {getShamingMessage(it) && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <p className="text-xs text-orange-600 dark:text-orange-400 truncate cursor-help">
+                          {getShamingMessage(it)}
+                        </p>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-[300px]">{getShamingMessage(it)}</TooltipContent>
+                    </Tooltip>
+                  )}
+                  {it.autoArchived && (
+                    <p className="text-xs text-gray-500 italic">Auto-archived</p>
+                  )}
+                  <div className="flex gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-5 px-1 text-xs"
+                          onClick={() => extendLifespan(it.id, 7)}
+                        >
+                          <Clock className="size-3 mr-1" />
+                          +7d
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Extend by 7 days</TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-5 px-1 text-xs"
+                          onClick={() => {
+                            setSummaryItemId(it.id)
+                            if (!it.summary) {
+                              generateSummary(it.id)
+                            }
+                            setSummaryDialogOpen(true)
+                          }}
+                        >
+                          <Sparkles className="size-3 mr-1" />
+                          {it.summary ? 'View' : 'Gen'}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{it.summary ? 'View AI summary' : 'Generate AI summary'}</TooltipContent>
+                    </Tooltip>
+                  </div>
+                </div>
+              </TableCell>
               <TableCell className="text-right w-[56px]">
                 <div className="inline-flex items-center justify-end w-full">
                   <RowActions
@@ -815,6 +1029,120 @@ function Dashboard() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* OneTab Import Dialog */}
+      <Dialog open={oneTabDialogOpen} onOpenChange={(open) => {
+        setOneTabDialogOpen(open)
+        if (!open) {
+          setOneTabPreviewMode(false)
+          setOneTabGroups([])
+        }
+      }}>
+        <DialogContent className="max-w-3xl max-h-[80vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Import from OneTab</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            {!oneTabPreviewMode ? (
+              <>
+                <p className="text-sm text-muted-foreground">
+                  Paste your OneTab export below. Use OneTab's <strong>"Export / Import URLs"</strong> button (top right of OneTab page) to export all your tabs at once.
+                </p>
+                <code className="block text-xs bg-muted p-2 rounded leading-relaxed">
+                  https://example.com | Page Title<br />
+                  https://another.com | Another Title<br />
+                  https://third.com | Third Title<br />
+                  ...<br />
+                  <br />
+                  All tabs will be grouped as "Import #[number]" so you can see what was imported together
+                </code>
+                <textarea
+                  className="w-full h-64 p-3 border rounded-md font-mono text-sm"
+                  placeholder="Paste OneTab export here..."
+                  value={oneTabText}
+                  onChange={(e) => setOneTabText(e.target.value)}
+                />
+                <div className="flex gap-2 justify-end">
+                  <Button variant="ghost" onClick={() => setOneTabDialogOpen(false)}>Cancel</Button>
+                  <Button onClick={importOneTab}>Preview Import</Button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-muted-foreground">
+                  Found {oneTabGroups.length} group(s) with {oneTabGroups.reduce((sum, g) => sum + g.tabs.length, 0)} tab(s) total.
+                </p>
+                <div className="space-y-4 max-h-[400px] overflow-y-auto border rounded-md p-3">
+                  {oneTabGroups.map((group, idx) => (
+                    <div key={idx} className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline" className="font-semibold">
+                          {group.name}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {group.tabs.length} tab(s)
+                        </span>
+                      </div>
+                      <div className="pl-4 space-y-1">
+                        {group.tabs.slice(0, 5).map((tab, tabIdx) => (
+                          <div key={tabIdx} className="text-xs text-gray-600 dark:text-gray-400 truncate">
+                            • {tab.title || tab.url}
+                          </div>
+                        ))}
+                        {group.tabs.length > 5 && (
+                          <div className="text-xs text-muted-foreground italic">
+                            ... and {group.tabs.length - 5} more
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-2 justify-end">
+                  <Button variant="ghost" onClick={() => {
+                    setOneTabPreviewMode(false)
+                    setOneTabGroups([])
+                  }}>Back</Button>
+                  <Button onClick={importOneTab}>Confirm Import</Button>
+                </div>
+              </>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* AI Summary Dialog */}
+      <Dialog open={summaryDialogOpen} onOpenChange={setSummaryDialogOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>AI Summary</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            {generatingSummary ? (
+              <div className="flex items-center gap-2 py-8 justify-center">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+                <p>Generating summary...</p>
+              </div>
+            ) : summaryItemId ? (
+              <div className="space-y-2">
+                <p className="text-sm whitespace-pre-wrap">
+                  {items.find((i) => i.id === summaryItemId)?.summary || 'No summary available.'}
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">No item selected.</p>
+            )}
+            <div className="flex gap-2 justify-end">
+              <Button variant="ghost" onClick={() => setSummaryDialogOpen(false)}>Close</Button>
+              {summaryItemId && (
+                <Button onClick={() => generateSummary(summaryItemId)} disabled={generatingSummary}>
+                  Regenerate
+                </Button>
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

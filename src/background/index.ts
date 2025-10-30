@@ -4,6 +4,7 @@ import type { Item, TabSummary, TabWithStatus } from '../shared/types'
 import { normalizeUrl, sha256Hex } from '../shared/url'
 // Sync removed in v1
 import { getSettings } from '../shared/settings'
+import { calculateExpiresAt, DEFAULT_LIFESPAN_DAYS, isExpired } from '../shared/lifespan'
 
 async function queryTabs(currentWindow = true): Promise<TabSummary[]> {
   const tabs = await chrome.tabs.query({ currentWindow })
@@ -60,6 +61,8 @@ async function upsertItemFromTab(tab: TabSummary, tags: string[] = []): Promise<
     })
     return 'update'
   }
+  const lifespanDays = DEFAULT_LIFESPAN_DAYS
+  const expiresAt = calculateExpiresAt(now, lifespanDays)
   const item: Item = {
     id: crypto.randomUUID(),
     url: originalUrl,
@@ -70,7 +73,9 @@ async function upsertItemFromTab(tab: TabSummary, tags: string[] = []): Promise<
     lastSeenAt: now,
     status: 'stashed',
     timesAdded: 1,
-    tags: tags
+    tags: tags,
+    lifespanDays,
+    expiresAt
   }
   await db.items.add(item)
   return 'add'
@@ -117,14 +122,43 @@ async function stashTabs(
   return { added, updated, closed }
 }
 
+async function autoArchiveExpiredItems() {
+  try {
+    const allItems = await db.items.where('status').equals('stashed').toArray()
+    const expired = allItems.filter((item) => isExpired(item))
+    
+    if (expired.length > 0) {
+      for (const item of expired) {
+        await db.items.update(item.id, {
+          status: 'archived',
+          autoArchived: true
+        })
+      }
+      console.log(`Auto-archived ${expired.length} expired item(s)`)
+      try {
+        chrome.runtime.sendMessage({ type: 'EVENT_ITEMS_CHANGED' } as any)
+      } catch {}
+    }
+  } catch (e) {
+    console.error('Auto-archive failed:', e)
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   // Ensure toolbar click opens the Side Panel
   chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {})
+  // Run initial auto-archive check
+  autoArchiveExpiredItems()
 })
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {})
+  // Run auto-archive on startup
+  autoArchiveExpiredItems()
 })
+
+// Run auto-archive check every 6 hours
+setInterval(autoArchiveExpiredItems, 6 * 60 * 60 * 1000)
 
 chrome.runtime.onMessage.addListener((msg: BgMessage, _sender: any, sendResponse: (res: BgResponse) => void) => {
   ;(async () => {
@@ -179,46 +213,95 @@ chrome.runtime.onMessage.addListener((msg: BgMessage, _sender: any, sendResponse
         }
         case 'IMPORT_ITEMS': {
           const now = Date.now()
-          let imported = 0
-          let updated = 0
-          const toInsert: Item[] = []
-          const toUpdate: { id: string; patch: Partial<Item> }[] = []
           const settings = await getSettings()
-          for (const raw of msg.items) {
+          
+          // PERFORMANCE OPTIMIZATION: Batch process all URLs first
+          // Instead of individual lookups (N queries), we do 1 bulk query
+          const urlData: Array<{ url: string; normalized: string; hash: string; raw: any }> = []
+          
+          // Step 1: Normalize all URLs and compute hashes in parallel
+          const hashPromises = msg.items.map(async (raw) => {
             try {
               const originalUrl = raw.url
-              if (!isHttpUrl(originalUrl)) continue
-              const n = normalizeUrl(originalUrl, { stripAllParams: settings.stripAllParams, stripTracking: settings.stripTrackingParams })
-              const urlHash = await sha256Hex(n)
-              const existing = await db.items.where('urlHash').equals(urlHash).first()
-              const tags = Array.from(new Set((existing?.tags || []).concat(raw.tags || [])))
-              if (existing) {
-                toUpdate.push({ id: existing.id, patch: {
+              if (!isHttpUrl(originalUrl)) return null
+              const normalized = normalizeUrl(originalUrl, { 
+                stripAllParams: settings.stripAllParams, 
+                stripTracking: settings.stripTrackingParams 
+              })
+              const hash = await sha256Hex(normalized)
+              return { url: originalUrl, normalized, hash, raw }
+            } catch {
+              return null
+            }
+          })
+          
+          const results = await Promise.all(hashPromises)
+          for (const result of results) {
+            if (result) urlData.push(result)
+          }
+          
+          if (urlData.length === 0) {
+            sendResponse({ ok: true, imported: 0, updated: 0 } satisfies BgResponse)
+            break
+          }
+          
+          // Step 2: Batch fetch all existing items with matching hashes (1 query instead of N)
+          const allHashes = urlData.map(d => d.hash)
+          const existingItems = await db.items.where('urlHash').anyOf(allHashes).toArray()
+          const existingMap = new Map(existingItems.map(it => [it.urlHash, it]))
+          
+          // Step 3: Process in memory (fast)
+          const toInsert: Item[] = []
+          const toUpdate: { id: string; patch: Partial<Item> }[] = []
+          let imported = 0
+          let updated = 0
+          
+          for (const { url, hash, raw } of urlData) {
+            const existing = existingMap.get(hash)
+            const tags = Array.from(new Set((existing?.tags || []).concat(raw.tags || [])))
+            
+            if (existing) {
+              toUpdate.push({ 
+                id: existing.id, 
+                patch: {
                   title: raw.title ?? existing.title,
                   status: raw.status ?? existing.status,
                   tags,
                   lastSeenAt: now
-                } })
-                updated++
-              } else {
-                const item: Item = {
-                  id: crypto.randomUUID(),
-                  url: originalUrl,
-                  urlHash,
-                  title: raw.title,
-                  createdAt: raw.createdAt ?? now,
-                  lastSeenAt: now,
-                  status: raw.status ?? 'stashed',
-                  timesAdded: 1,
-                  tags
-                }
-                toInsert.push(item)
-                imported++
+                } 
+              })
+              updated++
+            } else {
+              const createdAt = raw.createdAt ?? now
+              const lifespanDays = DEFAULT_LIFESPAN_DAYS
+              const expiresAt = calculateExpiresAt(createdAt, lifespanDays)
+              const item: Item = {
+                id: crypto.randomUUID(),
+                url,
+                urlHash: hash,
+                title: raw.title,
+                createdAt,
+                lastSeenAt: now,
+                status: raw.status ?? 'stashed',
+                timesAdded: 1,
+                tags,
+                lifespanDays,
+                expiresAt,
+                group: raw.group,
+                groupCreatedAt: raw.groupCreatedAt
               }
-            } catch {}
+              toInsert.push(item)
+              imported++
+            }
           }
+          
+          // Step 4: Batch write to database
           if (toInsert.length) await db.items.bulkAdd(toInsert, { allKeys: false })
-          for (const u of toUpdate) await db.items.update(u.id, u.patch)
+          if (toUpdate.length) {
+            // Batch updates for better performance
+            await Promise.all(toUpdate.map(u => db.items.update(u.id, u.patch)))
+          }
+          
           sendResponse({ ok: true, imported, updated } satisfies BgResponse)
           try { chrome.runtime.sendMessage({ type: 'EVENT_ITEMS_CHANGED' } as any) } catch {}
           break
@@ -262,6 +345,39 @@ chrome.runtime.onMessage.addListener((msg: BgMessage, _sender: any, sendResponse
           }
           await chrome.tabs.create({ url: msg.url })
           sendResponse({ ok: true, opened: true } satisfies BgResponse)
+          break
+        }
+        case 'EXTEND_LIFESPAN': {
+          const item = await db.items.get(msg.id)
+          if (!item) {
+            sendResponse({ ok: false, error: 'Item not found' } as BgResponse)
+            break
+          }
+          const currentLifespan = item.lifespanDays ?? DEFAULT_LIFESPAN_DAYS
+          const newLifespan = currentLifespan + msg.additionalDays
+          const newExpiresAt = calculateExpiresAt(item.createdAt, newLifespan)
+          await db.items.update(msg.id, {
+            lifespanDays: newLifespan,
+            expiresAt: newExpiresAt
+          })
+          sendResponse({ ok: true, extended: true } satisfies BgResponse)
+          try { chrome.runtime.sendMessage({ type: 'EVENT_ITEMS_CHANGED' } as any) } catch {}
+          break
+        }
+        case 'GENERATE_SUMMARY': {
+          const item = await db.items.get(msg.id)
+          if (!item) {
+            sendResponse({ ok: false, error: 'Item not found' } as BgResponse)
+            break
+          }
+          // Placeholder for AI summary generation
+          // This would integrate with an AI service (OpenAI, Anthropic, etc.)
+          // For now, return a placeholder that indicates where AI integration should go
+          const summary = `[AI Summary Placeholder]\n\nThis is where an AI-generated summary would appear. To implement:\n1. Add API key configuration in settings\n2. Fetch page content\n3. Send to AI service with prompt: "Summarize this article in 2-3 sentences"\n4. Match against defined tags if any\n\nTitle: ${item.title || 'Untitled'}\nURL: ${item.url}\nTags: ${(item.tags || []).join(', ') || 'None'}`
+          
+          await db.items.update(msg.id, { summary })
+          sendResponse({ ok: true, summary } satisfies BgResponse)
+          try { chrome.runtime.sendMessage({ type: 'EVENT_ITEMS_CHANGED' } as any) } catch {}
           break
         }
         default:
